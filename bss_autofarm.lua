@@ -1,352 +1,347 @@
--- Bee Swarm Simulator all-in-one farm for Matcha
--- Features: fly-move to fields/hive, auto convert, token collector, auto dig,
--- anti-AFK (sends real input so Roblox never sees you as idle), HUD, manual-move pause.
-
+--========================================================
+-- Matcha | Bee Swarm Simulator Auto Farm
+--========================================================
 local Players = game:GetService("Players")
-local LocalPlayer = Players.LocalPlayer
+local LP = Players.LocalPlayer
 
-pcall(function() setrobloxinput(true) end)
+-- Windows VK codes
+local K = { W = 0x57, A = 0x41, S = 0x53, D = 0x44, E = 0x45, SPACE = 0x20 }
 
-local S = {
-    status = "Idle",
-    fieldNames = {},
-    fieldParts = {},
-    angle = 0,
-    pauseUntil = 0,
-    goHive = false,
-    startTime = tick(),
-    startHoney = nil,
-    lastAfk = tick(),
-    afkPings = 0,
-    badTokens = {},
+local FIELDS = {
+    "Sunflower Field", "Dandelion Field", "Mushroom Field", "Blue Flower Field",
+    "Clover Field", "Spider Field", "Bamboo Field", "Strawberry Field",
+    "Pineapple Patch", "Stump Field", "Cactus Field", "Pumpkin Patch",
+    "Pine Tree Forest", "Rose Field", "Mountain Top Field", "Coconut Field",
+    "Pepper Patch"
 }
+local PATTERNS = { "Zigzag", "Circle", "Spiral", "Corners", "Random" }
 
--- ===== helpers =====
-local function fmt(n)
-    n = math.floor(n or 0)
-    local s = tostring(n)
-    local out = s:reverse():gsub("(%d%d%d)", "%1,"):reverse()
-    if out:sub(1, 1) == "," then out = out:sub(2) end
-    return out
-end
-
-local function fmtTime(sec)
-    sec = math.floor(sec)
-    return string.format("%02d:%02d:%02d", math.floor(sec / 3600), math.floor(sec / 60) % 60, sec % 60)
+--========================================================
+-- Helpers
+--========================================================
+local function val(id, def)
+    local ok, v = pcall(UI.GetValue, id)
+    if ok and v ~= nil then return v end
+    return def
 end
 
 local function getHRP()
-    local char = LocalPlayer.Character
-    return char and char:FindFirstChild("HumanoidRootPart")
+    local c = LP.Character
+    return c and c:FindFirstChild("HumanoidRootPart")
+end
+
+local function getHum()
+    local c = LP.Character
+    return c and c:FindFirstChild("Humanoid")
+end
+
+local function alive()
+    local h, hrp = getHum(), getHRP()
+    return h and hrp and h.Health > 0
+end
+
+local function getStats()
+    local cs = LP:FindFirstChild("CoreStats")
+    if not cs then return 0, 1 end
+    local p, c = cs:FindFirstChild("Pollen"), cs:FindFirstChild("Capacity")
+    if not p or not c then return 0, 1 end
+    return p.Value, math.max(c.Value, 1)
+end
+
+local function flat(v) return Vector3.new(v.X, 0, v.Z) end
+
+--========================================================
+-- Input / movement
+--========================================================
+local held = { [K.W] = false, [K.A] = false, [K.S] = false, [K.D] = false }
+
+local function setKey(code, state)
+    if held[code] == state then return end
+    held[code] = state
+    if state then keypress(code) else keyrelease(code) end
+end
+
+local function releaseAll()
+    for code, _ in pairs(held) do setKey(code, false) end
+end
+
+local running = true
+local state = "Idle"
+local lastJump = 0
+
+-- Camera-relative walking using WASD
+local function walkTo(target, timeout, stopDist, abort)
+    local startT = tick()
+    while running and tick() - startT < timeout do
+        if not alive() then break end
+        if abort and abort() then break end
+
+        local hrp = getHRP()
+        local delta = flat(target - hrp.Position)
+        local mag = delta.Magnitude
+        if mag < stopDist then releaseAll() return true end
+
+        local cam = workspace.CurrentCamera.CFrame
+        local look = flat(cam.LookVector)
+        local right = flat(cam.RightVector)
+        if look.Magnitude < 0.01 then look = Vector3.new(0, 0, -1) else look = look.Unit end
+        if right.Magnitude < 0.01 then right = Vector3.new(1, 0, 0) else right = right.Unit end
+
+        local dir = delta / mag
+        local f, r = dir:Dot(look), dir:Dot(right)
+        setKey(K.W, f > 0.35)
+        setKey(K.S, f < -0.35)
+        setKey(K.D, r > 0.35)
+        setKey(K.A, r < -0.35)
+
+        -- periodic hop to get over small obstacles
+        if tick() - lastJump > 1.5 then
+            lastJump = tick()
+            keypress(K.SPACE) wait(0.05) keyrelease(K.SPACE)
+        end
+        wait(0.03)
+    end
+    releaseAll()
+    return false
+end
+
+--========================================================
+-- Field / hive lookup
+--========================================================
+local function getField()
+    local name = FIELDS[val("field", 1)] or FIELDS[1]
+    local zones = workspace:FindFirstChild("FlowerZones")
+    local zone = zones and zones:FindFirstChild(name)
+    if not zone then return nil end
+    local center = zone.Position
+    local radius = 40
+    pcall(function() radius = math.min(zone.Size.X, zone.Size.Z) / 2 end)
+    return zone, center, radius
 end
 
 local function getHivePos()
-    local hive = LocalPlayer:FindFirstChild("Honeycomb")
-    hive = hive and hive.Value
-    if not hive then return nil end
-    local spawn = hive:FindFirstChild("SpawnPos")
-    if spawn then return spawn.Position end
-    local arrow = hive:FindFirstChild("patharrow")
-    local base = arrow and arrow:FindFirstChild("Base")
-    if base then return base.Position end
-    if hive.PrimaryPart then return hive.PrimaryPart.Position end
+    local hives = workspace:FindFirstChild("Honeycombs")
+    if not hives then return nil end
+    for _, hive in ipairs(hives:GetChildren()) do
+        local owner = hive:FindFirstChild("Owner")
+        if owner and owner.Value == LP then
+            local sp = hive:FindFirstChild("SpawnPos")
+            if sp then return sp.Value.Position end
+            local part = hive.PrimaryPart or hive:FindFirstChildWhichIsA("BasePart")
+            if part then return part.Position end
+        end
+    end
     return nil
 end
 
-local function getStat(name)
-    local stats = LocalPlayer:FindFirstChild("CoreStats")
-    local v = stats and stats:FindFirstChild(name)
-    return v and v.Value or 0
-end
+--========================================================
+-- Field movement patterns
+--========================================================
+local pIndex, pAngle, pRad = 0, 0, 0.1
 
-local function getPollen()
-    return getStat("Pollen"), math.max(getStat("Capacity"), 1)
-end
+local function nextWaypoint(center, radius)
+    local mode = PATTERNS[val("pattern", 1)] or "Zigzag"
+    local R = radius * (val("radius_pct", 80) / 100)
+    pIndex = pIndex + 1
 
-local function loadFields()
-    S.fieldNames, S.fieldParts = {}, {}
-    local zones = workspace:FindFirstChild("FlowerZones")
-    if not zones then return end
-    for _, z in ipairs(zones:GetChildren()) do
-        table.insert(S.fieldNames, z.Name)
-        S.fieldParts[z.Name] = z
-    end
-    table.sort(S.fieldNames)
-end
-loadFields()
-
-local function manualInput()
-    return iskeypressed(0x57) or iskeypressed(0x41) or iskeypressed(0x53)
-        or iskeypressed(0x44) or iskeypressed(0x20)
-end
-
-local function enabled()
-    return UI.GetValue("bss_enabled")
-end
-
--- ===== fly move =====
--- Rises to a cruise height, flies over, then lowers onto the target.
--- Returns true on arrival, false if aborted (farm turned off / you moved).
-local function flyTo(target)
-    local speed = UI.GetValue("bss_fly_speed") or 80
-    local hrp = getHRP()
-    if not hrp then return false end
-
-    local cruise = math.max(hrp.Position.Y, target.Y) + 20
-    local waypoints = {
-        Vector3.new(hrp.Position.X, cruise, hrp.Position.Z),
-        Vector3.new(target.X, cruise, target.Z),
-        target,
-    }
-
-    for _, wp in ipairs(waypoints) do
-        while true do
-            hrp = getHRP()
-            if not hrp then return false end
-            if not enabled() and not S.goHive then return false end
-            if manualInput() then
-                S.pauseUntil = tick() + 1.5
-                return false
-            end
-            local cur = hrp.Position
-            local delta = wp - cur
-            local dist = delta.Magnitude
-            if dist < 2.5 then break end
-            local step = math.min(dist, speed * 0.03)
-            hrp.CFrame = CFrame.new(cur + delta * (step / dist))
-            wait(0.03)
-        end
-    end
-    return true
-end
-
--- ===== hive actions =====
-local function goHomeAndConvert()
-    local hivePos = getHivePos()
-    if not hivePos then return end
-    S.status = "Flying to hive"
-    if not flyTo(hivePos + Vector3.new(0, 4, 0)) then return end
-    wait(0.8)
-
-    if UI.GetValue("bss_convert") then
-        S.status = "Converting honey"
-        -- E toggles honey making, so only press it when pollen is actually still there,
-        -- and re-check after a few seconds that the pollen is really dropping.
-        local function pressE()
-            if isrbxactive() then keypress(0x45) wait(0.05) keyrelease(0x45) end
-        end
-        local before = getStat("Pollen")
-        if before > 0 then pressE() end
-        local checkAt = tick() + 4
-        local timeout = tick() + 150
-        while tick() < timeout and (enabled() or S.goHive) do
-            local p = getStat("Pollen")
-            if p <= 0 then break end
-            if manualInput() then S.pauseUntil = tick() + 1.5 return end
-            if tick() >= checkAt then
-                if p >= before then pressE() end -- not converting yet, toggle it on
-                before = p
-                checkAt = tick() + 4
-            end
-            wait(1)
-        end
-        wait(1)
+    if mode == "Zigzag" then
+        local rows = 6
+        local row = (pIndex - 1) % (rows * 2)
+        local z = -R + (math.floor(row / 2) / (rows - 1)) * 2 * R
+        local x = (row % 2 == 0) and -R or R
+        return center + Vector3.new(x, 0, z)
+    elseif mode == "Circle" then
+        pAngle = pAngle + math.rad(30)
+        return center + Vector3.new(math.cos(pAngle) * R, 0, math.sin(pAngle) * R)
+    elseif mode == "Spiral" then
+        pAngle = pAngle + math.rad(35)
+        pRad = pRad + 0.04
+        if pRad > 1 then pRad = 0.1 end
+        return center + Vector3.new(math.cos(pAngle) * R * pRad, 0, math.sin(pAngle) * R * pRad)
+    elseif mode == "Corners" then
+        local c = { {-1,-1}, {1,-1}, {1,1}, {-1,1}, {0,0} }
+        local p = c[(pIndex - 1) % #c + 1]
+        return center + Vector3.new(p[1] * R, 0, p[2] * R)
+    else
+        return center + Vector3.new((math.random() * 2 - 1) * R, 0, (math.random() * 2 - 1) * R)
     end
 end
 
--- ===== token collection =====
-local function findToken(fieldPart)
+--========================================================
+-- Tokens
+--========================================================
+local blacklist = {}
+
+local function findToken(center, radius)
     local folder = workspace:FindFirstChild("Collectibles")
+    if not folder then return nil end
     local hrp = getHRP()
-    if not folder or not hrp then return nil end
-    local half = math.min(fieldPart.Size.X, fieldPart.Size.Z) / 2 + 6
-    local best, bestDist = nil, 1e9
-    for _, c in ipairs(folder:GetChildren()) do
-        local ok, pos = pcall(function() return c.Position end)
-        if ok and pos and not (S.badTokens[c] and tick() < S.badTokens[c]) then
-            local flat = Vector3.new(pos.X - fieldPart.Position.X, 0, pos.Z - fieldPart.Position.Z)
-            if flat.Magnitude < half then
-                local d = (pos - hrp.Position).Magnitude
-                if d < bestDist then best, bestDist = c, d end
+    if not hrp then return nil end
+
+    local best, bestDist = nil, math.huge
+    local maxRange = radius * 1.3
+    for _, t in ipairs(folder:GetChildren()) do
+        local ok, pos = pcall(function() return t.Position end)
+        if ok and pos and (not blacklist[t] or tick() > blacklist[t]) then
+            if flat(pos - center).Magnitude <= maxRange then
+                local d = flat(pos - hrp.Position).Magnitude
+                if d < bestDist and d <= val("token_range", 60) then
+                    best, bestDist = t, d
+                end
             end
         end
     end
     return best
 end
 
--- ===== menu =====
-UI.AddTab("BSS Farm", function(tab)
-    local sec = tab:Section("Auto Farm", "Left")
-    sec:Toggle("bss_enabled", "Auto Farm", false)
-    if #S.fieldNames > 0 then
-        sec:Combo("bss_field", "Field", S.fieldNames, 1)
-    else
-        sec:Text("No fields found - rejoin and reload")
+--========================================================
+-- Honey conversion
+--========================================================
+local function convertHoney()
+    state = "Going to hive"
+    local hivePos = getHivePos()
+    if not hivePos then state = "Hive not found" wait(2) return end
+
+    walkTo(hivePos, 45, 4)
+    state = "Converting"
+
+    -- optional remote (ignored if the executor can't fire it)
+    pcall(function()
+        game:GetService("ReplicatedStorage").Events.PlayerHiveCommand:FireServer("ToggleHoneyMaking")
+    end)
+
+    local t0 = tick()
+    local last = getStats()
+    keypress(K.E) wait(0.1) keyrelease(K.E)
+    while running and tick() - t0 < 120 do
+        wait(2)
+        local p = getStats()
+        if p <= 0 then break end
+        -- not dropping => honey making was toggled off, press E again
+        if p >= last then
+            keypress(K.E) wait(0.1) keyrelease(K.E)
+        end
+        last = p
     end
-    sec:SliderInt("bss_return_pct", "Return to hive at % full", 50, 100, 100)
-    sec:SliderInt("bss_radius", "Walk radius (studs)", 5, 40, 18)
-    sec:SliderInt("bss_fly_speed", "Fly speed (studs/sec)", 20, 200, 80)
-    sec:Toggle("bss_convert", "Convert honey at hive", true)
-    sec:Toggle("bss_dig", "Auto dig (click)", true)
-    sec:Toggle("bss_tokens", "Collect tokens in field", true)
-    sec:Button("Fly to hive now", function() S.goHive = true end)
-    sec:Button("Reload fields", loadFields)
+    wait(1)
+end
 
-    local afk = tab:Section("Anti-AFK", "Right")
-    afk:Toggle("bss_antiafk", "Anti-AFK (stay active)", true)
-    afk:SliderInt("bss_afk_interval", "Ping every (sec)", 15, 300, 45)
-    afk:Tip("Sends tiny real mouse input so Roblox never marks you idle. Needs the Roblox window active.")
-
-    local hud = tab:Section("Display", "Right")
-    hud:Toggle("bss_hud", "Show on-screen HUD", true)
-    hud:Text("State: " .. S.status)
-    local pollen, cap = getPollen()
-    hud:Text(string.format("Pollen: %s / %s", fmt(pollen), fmt(cap)))
-    hud:Text("Uptime: " .. fmtTime(tick() - S.startTime))
+--========================================================
+-- Auto dig (own thread)
+--========================================================
+task.spawn(function()
+    while running do
+        if val("autofarm", false) and val("autodig", true) and state == "Farming" and isrbxactive() then
+            mouse1click()
+        end
+        wait(0.1)
+    end
 end)
 
--- ===== main farm loop =====
-local function step()
-    if not enabled() and not S.goHive then
-        S.status = "Idle"
-        return
+--========================================================
+-- Status overlay
+--========================================================
+local statusText = Drawing.new("Text")
+statusText.Outline = true
+statusText.Size = 16
+statusText.Color = Color3.fromRGB(255, 220, 90)
+statusText.Position = Vector2.new(20, 20)
+statusText.Visible = true
+
+task.spawn(function()
+    while running do
+        local p, c = getStats()
+        statusText.Text = string.format("State: %s\nPollen: %d / %d (%d%%)",
+            state, p, c, math.floor(p / c * 100))
+        wait(0.25)
     end
-    if tick() < S.pauseUntil then
-        S.status = "Paused (you are moving)"
-        return
-    end
+end)
 
-    local hrp = getHRP()
-    local hivePos = getHivePos()
-    if not hrp or not hivePos then
-        S.status = "Waiting for character / hive"
-        return
-    end
-
-    -- manual "fly to hive" button
-    if S.goHive then
-        goHomeAndConvert()
-        S.goHive = false
-        return
-    end
-
-    local fieldName = S.fieldNames[UI.GetValue("bss_field") or 1]
-    local field = fieldName and S.fieldParts[fieldName]
-    if not field then
-        S.status = "Pick a field"
-        return
-    end
-
-    local pollen, cap = getPollen()
-    local threshold = (UI.GetValue("bss_return_pct") or 100) / 100
-
-    -- bag full -> go home, convert, come back
-    if pollen >= cap * threshold then
-        goHomeAndConvert()
-        return
-    end
-
-    -- not in the field yet -> fly there
-    local half = math.min(field.Size.X, field.Size.Z) / 2
-    local flat = Vector3.new(hrp.Position.X - field.Position.X, 0, hrp.Position.Z - field.Position.Z)
-    if flat.Magnitude > half + 12 then
-        S.status = "Flying to " .. fieldName
-        flyTo(field.Position + Vector3.new(0, 4, 0))
-        return
-    end
-
-    S.status = "Farming " .. fieldName
-
-    -- grab a token if one is nearby
-    if UI.GetValue("bss_tokens") then
-        local tok = findToken(field)
-        if tok then
-            local ok, pos = pcall(function() return tok.Position end)
-            if ok and pos then
-                S.badTokens[tok] = tick() + 4
-                S.status = "Collecting token"
-                local h = getHRP()
-                if h then h.CFrame = CFrame.new(pos + Vector3.new(0, 3, 0)) end
-                wait(0.15)
+--========================================================
+-- Main farm loop (non-stop)
+--========================================================
+task.spawn(function()
+    pcall(function() setrobloxinput(true) end)
+    while running do
+        local ok, err = pcall(function()
+            if not val("autofarm", false) or not alive() then
+                releaseAll()
+                state = "Idle"
+                wait(0.5)
                 return
             end
-        end
-    end
 
-    -- spiral over the flowers
-    local r = math.min(UI.GetValue("bss_radius") or 18, half - 2)
-    S.angle = S.angle + 0.45
-    local rr = r * (0.4 + 0.6 * math.abs(math.sin(S.angle / 6)))
-    local offset = Vector3.new(math.cos(S.angle) * rr, 4, math.sin(S.angle) * rr)
-    hrp.CFrame = CFrame.new(field.Position + offset)
+            local zone, center, radius = getField()
+            if not zone then state = "Field not found" wait(1) return end
 
-    if UI.GetValue("bss_dig") and isrbxactive() then mouse1click() end
-end
+            local pollen, cap = getStats()
 
-task.spawn(function()
-    while true do
-        wait(0.25)
-        if manualInput() then S.pauseUntil = tick() + 1.5 end
-        local ok, err = pcall(step)
-        if not ok then S.status = "Error: " .. tostring(err) end
-    end
-end)
+            -- 1) bag full -> hive -> back to field
+            if pollen / cap >= val("convert_pct", 98) / 100 then
+                convertHoney()
+                state = "Returning"
+                walkTo(center, 45, 6)
+                return
+            end
 
--- ===== anti-AFK =====
-task.spawn(function()
-    while true do
-        wait(1)
-        if UI.GetValue("bss_antiafk") then
-            local interval = UI.GetValue("bss_afk_interval") or 45
-            if tick() - S.lastAfk >= interval then
-                S.lastAfk = tick()
-                if isrbxactive() then
-                    mousemoverel(3, 0)
-                    wait(0.05)
-                    mousemoverel(-3, 0)
-                    S.afkPings = S.afkPings + 1
+            -- 2) too far from field -> walk back
+            local hrp = getHRP()
+            if flat(hrp.Position - center).Magnitude > radius * 1.8 then
+                state = "Going to field"
+                walkTo(center, 45, 6)
+                return
+            end
+
+            state = "Farming"
+
+            -- 3) follow tokens
+            if val("tokens", true) then
+                local token = findToken(center, radius)
+                if token then
+                    state = "Token"
+                    local ok2, pos = pcall(function() return token.Position end)
+                    if ok2 then
+                        local reached = walkTo(pos, 3, 2.5, function()
+                            local p, c = getStats()
+                            return p / c >= val("convert_pct", 98) / 100
+                        end)
+                        if not reached then blacklist[token] = tick() + 5 end
+                    end
+                    return
                 end
             end
-        end
-        -- real farming input also counts as activity
-        if enabled() then S.lastAfk = math.max(S.lastAfk, tick() - 20) end
+
+            -- 4) field pattern
+            walkTo(nextWaypoint(center, radius), 6, 3, function()
+                local p, c = getStats()
+                return p / c >= val("convert_pct", 98) / 100
+            end)
+        end)
+        if not ok then warn("[BSS] " .. tostring(err)) wait(0.5) end
+        wait(0.03)
     end
 end)
 
--- ===== HUD =====
-local hud = Drawing.new("Text")
-hud.Position = Vector2.new(20, 20)
-hud.Outline = true
-hud.Center = false
--- text size property name differs between Matcha builds, so try each safely
-if not pcall(function() hud.Size = 16 end) then
-    pcall(function() hud.FontSize = 16 end)
-end
-hud.Color = Color3.fromRGB(255, 220, 90)
-hud.Visible = false
+--========================================================
+-- Menu
+--========================================================
+UI.AddTab("Bee Swarm", function(tab)
+    local farm = tab:Section("Auto Farm", "Left")
+    farm:Toggle("autofarm", "Auto Farm", false)
+    farm:Combo("field", "Field", FIELDS, 1)
+    farm:Combo("pattern", "Movement Pattern", PATTERNS, 1)
+    farm:SliderInt("radius_pct", "Field Coverage %", 20, 100, 80)
+    farm:SliderInt("convert_pct", "Convert at Capacity %", 50, 100, 98)
 
-task.spawn(function()
-    while true do
-        wait(0.3)
-        if UI.GetValue("bss_hud") then
-            local honey = getStat("Honey")
-            if not S.startHoney then S.startHoney = honey end
-            local gained = honey - S.startHoney
-            local hours = math.max((tick() - S.startTime) / 3600, 0.0001)
-            local pollen, cap = getPollen()
-            local afkLeft = math.max(0, (UI.GetValue("bss_afk_interval") or 45) - (tick() - S.lastAfk))
-            hud.Text = table.concat({
-                "BSS Farm  |  " .. S.status,
-                "Pollen: " .. fmt(pollen) .. " / " .. fmt(cap),
-                "Honey gained: " .. fmt(gained) .. "  (" .. fmt(gained / hours) .. "/hr)",
-                "Uptime: " .. fmtTime(tick() - S.startTime),
-                "Anti-AFK: " .. (UI.GetValue("bss_antiafk") and ("active, next ping " .. math.floor(afkLeft) .. "s") or "off"),
-            }, "\n")
-            hud.Visible = true
-        else
-            hud.Visible = false
-        end
-    end
+    local opt = tab:Section("Options", "Right")
+    opt:Toggle("autodig", "Auto Dig", true)
+    opt:Toggle("tokens", "Follow Tokens", true)
+    opt:SliderInt("token_range", "Token Range", 10, 150, 60)
+    opt:Button("Unload", function()
+        running = false
+        releaseAll()
+        statusText:Remove()
+    end)
 end)
 
-notify("BSS farm loaded - open the 'BSS Farm' tab", "Matcha", 5)
+notify("Bee Swarm farm loaded", "Matcha", 4)
