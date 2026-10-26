@@ -318,7 +318,10 @@ local hud = Drawing.new("Text")
 hud.Position = Vector2.new(20, 20)
 hud.Outline = true
 hud.Center = false
-hud.FontSize = 16
+-- text size property name differs between Matcha builds, so try each safely
+if not pcall(function() hud.Size = 16 end) then
+    pcall(function() hud.FontSize = 16 end)
+end
 hud.Color = Color3.fromRGB(255, 220, 90)
 hud.Visible = false
 
